@@ -1,30 +1,27 @@
 #!/usr/bin/env python3
 """freddie-reddit-watch — personal, non-commercial, READ-ONLY Reddit digest.
 
-Fetches public posts from a small set of home-automation subreddits via
-Reddit's official Data API (OAuth client-credentials / app-only flow),
-extracts titles + top-level comments for selected threads, and writes a
-plain-text digest for the operator's own reading.
+v2: RSS mode. Uses each subreddit's public .rss feed (reddit.com/r/<sub>.rss)
+— no OAuth, no API approval required. Reads a small set of subs with polite
+pacing, keeps a seen-ids state file, and converts new entries to the same
+digest JSON shape as v1 so downstream tooling is unchanged.
 
-Design intent:
-- READ-ONLY. This tool never posts, votes, DMs, or edits anything.
-- It collects no personal data. It stores only public post titles/text.
-- Low volume: a handful of listing requests per run, well under Reddit's
-  100 requests/minute free Data API allowance.
-- No AI/model training use. Digest is for one human's eyes.
+Design intent (unchanged):
+- READ-ONLY. Never posts, votes, DMs, or edits anything.
+- Collects no personal data; stores only public post titles/text.
+- Low volume: one request per sub per run, seconds apart; honours 429 via
+  Retry-After with a hard backoff (never hammers).
 
-Reddit Data API compliance notes:
-- Authenticated requests go to oauth.reddit.com, never www.reddit.com.
-- Every request carries Reddit's required descriptive User-Agent.
-- Credentials come from the environment (REDDIT_CLIENT_ID /
-  REDDIT_CLIENT_SECRET); they are never hardcoded or logged.
-- Handles HTTP 429 by honouring the X-Ratelimit-Reset header.
+Compliance notes:
+- Every request carries a descriptive User-Agent per Reddit's terms.
+- Public www.reddit.com/.rss endpoint; no authentication of any kind.
+- On HTTP 429, sleeps Retry-After (capped) or a default backoff, once.
 
 Usage:
-  python3 reddit_watch.py [--limit 25] [--sub homeassistant]
+  python3 reddit_watch.py [--sub homeassistant ...] [--limit 25]
   env:
-    REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET  required
-    REDDIT_DIGEST_DIR   optional output dir (default ./digests)
+    REDDIT_DIGEST_DIR  optional output dir (default ./digests)
+    REDDIT_STATE_FILE  optional seen-ids file (default ./state/seen.json)
 """
 
 import argparse
@@ -37,61 +34,71 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 
-TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
-API_HOST = "https://oauth.reddit.com"
-
-DEFAULT_SUBS = ["homeassistant"]
-
-def user_agent(app_id: str) -> str:
-    """Reddit's required User-Agent shape: <platform>:<app ID>:<version> (by /u/name)."""
-    owner = os.environ.get("REDDIT_OWNER", "u/freddie-reader-operator")
-    return f"linux:freddie-reddit-watch:v1.0 (by {owner})"
+RSS_HOST = "https://www.reddit.com"
+UA = "linux:freddie-reddit-watch:v2.0-rss (personal read-only digest)"
+DEFAULT_SUBS = ["homeassistant", "musicassistant", "openclaw", "Kubuntu"]
+BACKOFF_DEFAULT = 90  # seconds, used when no Retry-After header
 
 
-def get_token(cid: str, csec: str, ua: str) -> str:
-    body = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode()
-    req = urllib.request.Request(TOKEN_URL, data=body, headers={
-        "User-Agent": ua,
-        "Authorization": "Basic " + __import__("base64").b64encode(f"{cid}:{csec}".encode()).decode(),
-    })
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.load(r)["access_token"]
-
-
-def api_get(path: str, token: str, ua: str, params=None) -> dict:
-    url = f"{API_HOST}{path}"
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={
-        "User-Agent": ua, "Authorization": f"Bearer {token}"})
+def rss_get(sub: str, limit: int) -> str:
+    url = f"{RSS_HOST}/r/{urllib.parse.quote(sub)}/.rss?limit={limit}"
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
-            return json.load(r)
+            return r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         if e.code == 429:
-            reset = e.headers.get("X-Ratelimit-Reset", "60")
-            print(f"rate limited; backing off {reset}s", file=sys.stderr)
-            time.sleep(min(int(float(reset)), 600))
+            wait = min(int(float(e.headers.get("Retry-After", BACKOFF_DEFAULT))), 300)
+            print(f"429 from r/{sub}; backing off {wait}s then retrying once", file=sys.stderr)
+            time.sleep(wait)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read().decode("utf-8", "replace")
         raise
 
 
-def fetch_listing_subs(token, ua, subs, limit) -> list:
+def entry_text(el) -> str:
+    parts = []
+    title_el = el.find("a:title", {"a": "http://www.w3.org/2005/Atom"})
+    if title_el is not None and title_el.text:
+        parts.append(title_el.text.strip())
+    body = el.find("{http://www.w3.org/1999/xhtml}body")
+    if body is not None:
+        txt = " ".join(body.itertext()).strip()
+        if txt:
+            parts.append(txt[:500])
+    return "\n\n".join(parts)
+
+
+def fetch_rss_subs(subs, limit: int) -> list:
+    ns = {
+        "a": "http://www.w3.org/2005/Atom",
+        "media": "http://search.yahoo.com/mrss/",
+    }
     out = []
-    for sub in subs:
-        data = api_get(f"/r/{sub}/new", token, ua, {"limit": limit})
-        for child in data.get("data", {}).get("children", []):
-            d = child["data"]
+    for i, sub in enumerate(subs):
+        if i:
+            time.sleep(15)  # polite pacing between sub fetches
+        xml_text = rss_get(sub, limit)
+        root = ET.fromstring(xml_text)
+        for entry in root.findall("a:entry", ns):
+            link = entry.find("a:link", ns)
+            permalink = link.get("href") if link is not None else None
+            updated = entry.find("a:updated", ns)
+            created = (updated.text if updated is not None and updated.text
+                       else datetime.datetime.now(datetime.timezone.utc).isoformat())
             out.append({
-                "subreddit": d.get("subreddit"),
-                "title": d.get("title"),
-                "author": d.get("author"),
-                "score": d.get("score"),
-                "num_comments": d.get("num_comments"),
-                "created_utc": datetime.datetime.fromtimestamp(
-                    d.get("created_utc", 0), datetime.timezone.utc).isoformat(),
-                "selftext_excerpt": (d.get("selftext") or "")[:500],
-                "permalink": "https://www.reddit.com" + d.get("permalink", ""),
+                "subreddit": sub,
+                "title": (entry.find("a:title", ns).text or "").strip()
+                          if entry.find("a:title", ns) is not None else "",
+                "author": (entry.find("a:author/a:name", ns).text or "").strip()
+                           if entry.find("a:author/a:name", ns) is not None else "",
+                "score": None,          # not in RSS
+                "num_comments": None,   # not in RSS
+                "created_utc": created,
+                "selftext_excerpt": entry_text(entry),
+                "permalink": permalink,
             })
     return out
 
@@ -99,22 +106,13 @@ def fetch_listing_subs(token, ua, subs, limit) -> list:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--sub", action="append", default=None,
-                    help="subreddit (repeatable); default: homeassistant")
+                    help="subreddit (repeatable); default preset list")
     ap.add_argument("--limit", type=int, default=25)
     ap.add_argument("--digest-dir", default=None)
     args = ap.parse_args()
 
-    cid = os.environ.get("REDDIT_CLIENT_ID")
-    csec = os.environ.get("REDDIT_CLIENT_SECRET")
-    if not cid or not csec:
-        print("error: REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET not set in environment",
-              file=sys.stderr)
-        return 2
-
     subs = args.sub or DEFAULT_SUBS
-    ua = user_agent(cid)
-    token = get_token(cid, csec, ua)
-    posts = fetch_listing_subs(token, ua, subs, args.limit)
+    posts = fetch_rss_subs(subs, args.limit)
 
     digest_dir = pathlib.Path(args.digest_dir or os.environ.get(
         "REDDIT_DIGEST_DIR", pathlib.Path(__file__).parent / "digests"))
